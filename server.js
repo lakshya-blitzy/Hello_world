@@ -210,6 +210,17 @@ function bodyExceedsLimit(req, res) {
 // deliberately not set, so HEAD keeps omitting it.
 function respondSuccess(req, res) {
   try {
+    // A request dispatched before a fatal event still holds a deferred completion
+    // callback that nothing else cancels, so without this it would answer 200 out
+    // of an undefined process state during the fatal flush window -- measured.
+    // fatal() destroys the connections as well; this is the application-level half
+    // of the same cutoff, and it is the one that keeps the intent local to the
+    // write it prevents. Normal operation never reaches it: only fatal() ever sets
+    // the flag, and it exits the process immediately afterwards.
+    if (fatalHandled) {
+      res.destroy();
+      return;
+    }
     res.statusCode = 200;
     res.setHeader('Content-Type', 'text/plain');
     res.end(BODY);
@@ -501,9 +512,23 @@ function fatal(record) {
       leave();
     });
     recordQueued = true;
-    // Stop accepting, too, now that the record cannot be lost by a later failure.
+    // Stop accepting, now that the record cannot be lost by a later failure.
     if (server.listening) {
       server.close();
+    }
+    // Then stop serving. close() deliberately keeps established connections, so on
+    // its own it leaves a request dispatched before the fatal event free to reach
+    // its deferred completion and commit a 200 inside the flush window -- measured
+    // on this file before this call existed. Terminating the connections is what
+    // actually ends work already in progress, and it has to run whether or not the
+    // listener was still open, because a fatal raised during a drain finds it
+    // closed already. Ordered after close(), which is the order the runtime
+    // documents for these two calls. This is not a graceful stop: no drain is
+    // announced and no lifecycle line is written, because the process is leaving.
+    if (typeof server.closeAllConnections === 'function') {
+      server.closeAllConnections();
+    } else {
+      for (const socket of sockets) socket.destroy();
     }
   } catch (fatalPathError) {
     // An exception escaping a fatal handler is not caught again and would replace
