@@ -8,8 +8,9 @@ const port = 3000;
 // is why wire behaviour could shift between Node versions with no change here.
 // The four are pinned to exactly what the runtime already applied, so the wire
 // contract is unchanged; they are now explicit and adjustable in one place. The
-// MAX_*, SOCKET_IDLE and SHUTDOWN_GRACE values are new bounds closing the
-// unbounded-input, unbounded-stalled-request and unbounded-shutdown defects.
+// MAX_*, SOCKET_IDLE, SHUTDOWN_GRACE and FATAL_FLUSH values are new bounds closing
+// the unbounded-input, unbounded-stalled-request, unbounded-shutdown and
+// unbounded-fatal-flush defects.
 const HEADERS_TIMEOUT_MS = 60000;    // time allowed to receive complete headers
 const REQUEST_TIMEOUT_MS = 300000;   // time allowed to receive the entire request
 const KEEP_ALIVE_TIMEOUT_MS = 5000;  // idle time allowed after a response
@@ -20,6 +21,10 @@ const MAX_URL_LENGTH = 2048;         // request target longer than this -> 414
 const MAX_BODY_BYTES = 1048576;      // request body larger than this -> 413
 const SOCKET_IDLE_MS = 120000;       // socket inactivity bound; 0, the default, means none
 const SHUTDOWN_GRACE_MS = 10000;     // in-flight drain window before a forced close
+// A fatal record has to reach stderr before the process leaves, but waiting for a
+// stream that will never drain would turn the fatal path into a hang, so the wait
+// is bounded. See fatal() for why the wait exists at all.
+const FATAL_FLUSH_MS = 1000;         // longest wait for a fatal record to flush
 
 const ALLOWED_METHODS = ['GET', 'HEAD'];
 const BODY = 'Hello, World!\n';
@@ -30,6 +35,121 @@ const sockets = new Set();
 let shuttingDown = false;
 let forcedClose = false; // set when the grace deadline fires, so the exit code stays 1
 let hadError = false;    // a server 'error' event must not be erased by a later clean close
+let fatalHandled = false; // one fatal sequence per process, whichever handler arrives first
+
+// --- Failure-detail formatting -----------------------------------------------
+// A diagnostic is written while something has already gone wrong, so nothing in
+// producing it may itself fail, and nothing it carries may be trusted.
+//
+// A thrown or rejected value can be any value at all. `throw null` makes a bare
+// `err.stack` read throw TypeError; a Symbol cannot be interpolated into a
+// template at all; an object can carry a `stack` getter, a `toString()` or a
+// Proxy trap that throws, and a revoked Proxy throws on every access. Any of
+// those turns the diagnostic into a second, worse failure: in the request path it
+// escapes the handler's catch before the 500 is written, killing the process for
+// every client, and inside a process-level handler it is not caught again at all,
+// so the only record of the original failure disappears.
+//
+// The same value is also hostile data. CR/LF would let one caught value end its
+// record and forge another that reads like a lifecycle line; ESC and its friends
+// would let it drive an operator's terminal; and a custom toString() can emit
+// megabytes from a single event.
+//
+// Every failure detail therefore passes through the helpers below, which are
+// total: whatever they are handed, they return a bounded, printable string.
+const DETAIL_MAX_CHARS = 2048;   // cap on one formatted detail, before prefixes
+const DETAIL_MAX_LINES = 12;     // stack lines kept; the default trace is 11
+const LABEL_MAX_CHARS = 200;     // cap on a one-line code-or-message label
+const CONTINUATION_PREFIX = '  | ';
+const TRUNCATION_MARKER = '...<truncated>';
+const UNPRINTABLE_DETAIL = '<unprintable error>';
+
+// Reads one property without ever propagating a failure: the property may be a
+// getter that throws, and a revoked Proxy throws on every access.
+function safeRead(value, name) {
+  try {
+    return value[name];
+  } catch (readError) {
+    return undefined;
+  }
+}
+
+// Total conversion to a primitive string. String() rather than interpolation,
+// because interpolating a Symbol throws where String() is defined for it.
+function safeString(value) {
+  try {
+    return typeof value === 'string' ? value : String(value);
+  } catch (conversionError) {
+    // A throwing toString()/valueOf()/Symbol.toPrimitive, or a revoked Proxy.
+    return UNPRINTABLE_DETAIL;
+  }
+}
+
+// Drops every byte outside printable ASCII, which is the same policy logTarget()
+// applies to a request path. This is what stops a detail carrying ESC or any
+// other control byte into a terminal.
+function printableOnly(text) {
+  return text.replace(/[^\x20-\x7e]/g, '.');
+}
+
+// Collapses a value onto exactly one bounded line. CR and LF are escaped rather
+// than dropped, so the text stays readable while losing its ability to end this
+// record and start a forged one.
+function onOneLine(text, limit) {
+  const flattened = printableOnly(text.replace(/\r/g, '\\r').replace(/\n/g, '\\n'));
+  const bounded = flattened.length > limit
+    ? `${flattened.slice(0, limit)}${TRUNCATION_MARKER}`
+    : flattened;
+  return bounded === '' ? UNPRINTABLE_DETAIL : bounded;
+}
+
+// One-line rendering of a single field that is not itself an error: a parser byte
+// count, a fatal handler's origin.
+function safeValue(value) {
+  return onOneLine(safeString(value), LABEL_MAX_CHARS);
+}
+
+// One-line rendering of an error's short identity: its code, else its message,
+// else the value itself. The total form of the `err.code || err.message` idiom.
+function safeLabel(err) {
+  const code = safeRead(err, 'code');
+  if (typeof code === 'string' && code !== '') {
+    return safeValue(code);
+  }
+  if (typeof code === 'number') {
+    return safeValue(code);
+  }
+  const message = safeRead(err, 'message');
+  if (typeof message === 'string' && message !== '') {
+    return safeValue(message);
+  }
+  return safeValue(err);
+}
+
+// Full detail for a thrown or rejected value. A native multi-line stack is kept,
+// because it is the only thing that locates the failure, but every line after the
+// first is prefixed so that none of them can be read as a new top-level record,
+// and both the line count and the character count are bounded. Any other value
+// has no trusted shape, so it is collapsed onto a single line instead.
+function safeDetail(value) {
+  const stack = safeRead(value, 'stack');
+  if (typeof stack !== 'string' || stack === '') {
+    return onOneLine(safeString(value), DETAIL_MAX_CHARS);
+  }
+  const bounded = stack.length > DETAIL_MAX_CHARS
+    ? `${stack.slice(0, DETAIL_MAX_CHARS)}${TRUNCATION_MARKER}`
+    : stack;
+  const lines = bounded.split(/\r\n|\r|\n/);
+  const kept = lines.slice(0, DETAIL_MAX_LINES);
+  let record = printableOnly(kept[0]);
+  for (let i = 1; i < kept.length; i += 1) {
+    record += `\n${CONTINUATION_PREFIX}${printableOnly(kept[i])}`;
+  }
+  if (lines.length > kept.length) {
+    record += `\n${CONTINUATION_PREFIX}${TRUNCATION_MARKER}`;
+  }
+  return record;
+}
 
 // Request targets reach the log, so they are reduced to the path, stripped of
 // control characters and truncated. Query strings never appear: they can carry
@@ -95,7 +215,7 @@ function respondSuccess(req, res) {
     res.end(BODY);
   } catch (err) {
     // Reachable from the deferred path, which the handler's catch cannot see.
-    console.error(`error completing ${req.method} ${logTarget(req)}: ${err.stack || err}`);
+    console.error(`error completing ${req.method} ${logTarget(req)}: ${safeDetail(err)}`);
     sendError(res, 500);
   }
 }
@@ -103,8 +223,8 @@ function respondSuccess(req, res) {
 const server = http.createServer({ connectionsCheckingInterval: CONNECTIONS_CHECK_MS }, (req, res) => {
   try {
     // Surface stream failures instead of letting them reach the event loop.
-    req.on('error', (err) => console.error(`request stream error: ${err.code || err.message}`));
-    res.on('error', (err) => console.error(`response stream error: ${err.code || err.message}`));
+    req.on('error', (err) => console.error(`request stream error: ${safeLabel(err)}`));
+    res.on('error', (err) => console.error(`response stream error: ${safeLabel(err)}`));
 
     // Marks this socket as serving a request for as long as the response is open,
     // so shutdown can drain it rather than destroying it as idle. The reference is
@@ -205,8 +325,10 @@ const server = http.createServer({ connectionsCheckingInterval: CONNECTIONS_CHEC
     req.resume(); // explicit drain; flows the body and triggers 'end'
   } catch (err) {
     // Previously any throw here terminated the process and took the service down
-    // for every client. It now becomes a 500 for the one failing request.
-    console.error(`unhandled error serving ${req.method} ${logTarget(req)}: ${err.stack || err}`);
+    // for every client. It now becomes a 500 for the one failing request -- which
+    // holds for any thrown value, because formatting the detail cannot itself
+    // throw and so cannot jump past the sendError() below.
+    console.error(`unhandled error serving ${req.method} ${logTarget(req)}: ${safeDetail(err)}`);
     sendError(res, 500);
   }
 });
@@ -228,16 +350,19 @@ server.on('clientError', (err, socket) => {
     return;
   }
   socket.protocolErrorHandled = true;
-  console.error(`client protocol error: ${err.code || err.message} (bytesParsed=${err.bytesParsed})`);
-  if (err.code === 'ECONNRESET' || !socket.writable) {
+  // The parser owns this error, but the value still arrives as an object whose
+  // properties are read here, so it is read the same guarded way as any other.
+  const code = safeRead(err, 'code');
+  console.error(`client protocol error: ${safeLabel(err)} (bytesParsed=${safeValue(safeRead(err, 'bytesParsed'))})`);
+  if (code === 'ECONNRESET' || !socket.writable) {
     socket.destroy();
     return;
   }
   // Each of these statuses is one the runtime would have sent itself; attaching
   // this listener suppressed all of them, so the mapping is reproduced here.
   let status = 400;
-  if (err.code === 'HPE_HEADER_OVERFLOW') status = 431;
-  else if (err.code === 'ERR_HTTP_REQUEST_TIMEOUT') status = 408;
+  if (code === 'HPE_HEADER_OVERFLOW') status = 431;
+  else if (code === 'ERR_HTTP_REQUEST_TIMEOUT') status = 408;
   // Framing matches Node's own default reply byte for byte -- status line plus
   // Connection: close and nothing else -- so the wire form is preserved exactly.
   socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nConnection: close\r\n\r\n`);
@@ -246,12 +371,13 @@ server.on('clientError', (err, socket) => {
 // Bind failures previously surfaced as an unhandled 'error' event: a raw
 // node:events stack trace and exit 1 with no readiness line and no diagnosis.
 server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
+  const code = safeRead(err, 'code');
+  if (code === 'EADDRINUSE') {
     console.error(`Cannot start: ${hostname}:${port} is already in use. Stop the process holding it or choose another port.`);
-  } else if (err.code === 'EACCES') {
+  } else if (code === 'EACCES') {
     console.error(`Cannot start: permission denied binding ${hostname}:${port}.`);
   } else {
-    console.error(`Server error: ${err.stack || err}`);
+    console.error(`Server error: ${safeDetail(err)}`);
   }
   // exitCode rather than exit(): if the listener never bound the loop is already
   // empty and the process leaves with 1 once stderr has flushed.
@@ -321,8 +447,8 @@ function shutdown(signal) {
 
   server.close((err) => {
     clearTimeout(forced);
-    if (err && err.code !== 'ERR_SERVER_NOT_RUNNING') {
-      console.error(`Error during shutdown: ${err.message}`);
+    if (err && safeRead(err, 'code') !== 'ERR_SERVER_NOT_RUNNING') {
+      console.error(`Error during shutdown: ${safeLabel(err)}`);
       process.exitCode = 1;
       return;
     }
@@ -336,17 +462,87 @@ function shutdown(signal) {
 
 }
 
+// The single owner of the process-fatal path. The process state is undefined by
+// the time this runs, so it does the least it can while still guaranteeing three
+// things: exactly one fatal record, that record actually reaching stderr, and an
+// exit that cannot hang.
+function fatal(record) {
+  if (fatalHandled) return;
+  fatalHandled = true;
+  // Set before anything that could be interrupted, so the status is 1 even if the
+  // process leaves by some route other than the exit() below.
+  process.exitCode = 1;
+  // Stop serving. Nothing should receive a success answer out of an undefined
+  // state during the short window before the exit. This assignment cannot fail,
+  // so it is safe to make before the record is on its way.
+  shuttingDown = true;
+
+  let exited = false;
+  const leave = () => {
+    if (exited) return;
+    exited = true;
+    process.exit(1);
+  };
+  // The bound on the wait below. Deliberately not unref'd: it is what keeps the
+  // loop alive long enough to reach the exit, and it is what stops a stderr that
+  // never drains from turning this handler into a hang.
+  const failsafe = setTimeout(leave, FATAL_FLUSH_MS);
+
+  let recordQueued = false;
+  try {
+    // process.exit() terminates synchronously and abandons whatever a stream still
+    // has queued, and stderr is asynchronous whenever it is a pipe -- which is how
+    // a supervised process is normally run. Exiting straight after the write would
+    // therefore discard the only record of the failure, so the exit waits for this
+    // callback instead. Measured: with stderr a saturated pipe, writing and exiting
+    // immediately delivered the record 0 times out of 1.
+    process.stderr.write(`${record}\n`, () => {
+      clearTimeout(failsafe);
+      leave();
+    });
+    recordQueued = true;
+    // Stop accepting, too, now that the record cannot be lost by a later failure.
+    if (server.listening) {
+      server.close();
+    }
+  } catch (fatalPathError) {
+    // An exception escaping a fatal handler is not caught again and would replace
+    // exit 1 with the runtime's own internal-error status. If the record never
+    // reached the stream there is nothing left to wait for, so leave now;
+    // otherwise the pending write still owns the exit.
+    if (!recordQueued) {
+      clearTimeout(failsafe);
+      leave();
+    }
+  }
+}
+
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-// Last resort only: the process is in an undefined state, so log and exit.
+// Last resort only: the process is in an undefined state, so log and exit. The
+// record is built here and delivered by fatal(); the build is guarded because a
+// thrown value is arbitrary and this handler's own exceptions are not caught.
 process.on('uncaughtException', (err, origin) => {
-  console.error(`Fatal: uncaught exception (origin=${origin}): ${err.stack || err}`);
-  process.exit(1);
+  let record;
+  try {
+    record = `Fatal: uncaught exception (origin=${safeValue(origin)}): ${safeDetail(err)}`;
+  } catch (formatError) {
+    record = `Fatal: uncaught exception: ${UNPRINTABLE_DETAIL}`;
+  }
+  fatal(record);
 });
 process.on('unhandledRejection', (reason) => {
-  console.error(`Fatal: unhandled promise rejection: ${reason instanceof Error ? reason.stack : reason}`);
-  process.exit(1);
+  let record;
+  try {
+    // safeDetail() prefers a string `stack`, so a rejected Error still reports its
+    // stack and any other rejection reason -- Node permits any value -- reports
+    // itself on one line rather than throwing on the way to the log.
+    record = `Fatal: unhandled promise rejection: ${safeDetail(reason)}`;
+  } catch (formatError) {
+    record = `Fatal: unhandled promise rejection: ${UNPRINTABLE_DETAIL}`;
+  }
+  fatal(record);
 });
 
 server.listen(port, hostname, () => {
