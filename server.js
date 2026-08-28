@@ -435,6 +435,12 @@ function shutdown(signal) {
   console.log(`Received ${signal}, draining ${sockets.size} connection(s)`);
 
   const forced = setTimeout(() => {
+    // A fatal event owns the process from the moment it begins, so a graceful
+    // deadline that arrives afterwards must stay silent: its diagnostic would
+    // describe a stop that is no longer happening, and fatal() has already ended
+    // the connections this callback exists to end. Reached only when the close
+    // callback below has not run to clear this timer.
+    if (fatalHandled) return;
     console.error(`Shutdown grace period of ${SHUTDOWN_GRACE_MS}ms expired, forcing close`);
     forcedClose = true;
     if (typeof server.closeAllConnections === 'function') {
@@ -457,7 +463,19 @@ function shutdown(signal) {
   }
 
   server.close((err) => {
+    // The timer is cleared first and unconditionally: it belongs to this drain
+    // whichever way the drain ends, and leaving it armed would let it fire later.
     clearTimeout(forced);
+    // A fatal event can complete this drain rather than the drain completing
+    // itself: fatal() ends the connections that were holding close() pending, and
+    // this callback then becomes eligible while the fatal record is still queued.
+    // Announcing a clean stop from there would report a graceful shutdown that did
+    // not happen, on stdout, out of an undefined process state -- and, because
+    // stdout and stderr are separate pipes, possibly ahead of the fatal record
+    // itself. Measured: with an active request holding close() pending and stderr
+    // saturated, this callback wrote 'Server closed' inside the fatal flush
+    // window. The exit status belongs to fatal() alone from that point on.
+    if (fatalHandled) return;
     if (err && safeRead(err, 'code') !== 'ERR_SERVER_NOT_RUNNING') {
       console.error(`Error during shutdown: ${safeLabel(err)}`);
       process.exitCode = 1;
