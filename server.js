@@ -9,8 +9,7 @@ const port = 3000;
 // The four are pinned to exactly what the runtime already applied, so the wire
 // contract is unchanged; they are now explicit and adjustable in one place. The
 // MAX_*, SOCKET_IDLE and SHUTDOWN_GRACE values are new bounds closing the
-// unbounded-input, unbounded-stalled-request and unbounded-shutdown defects, and
-// FATAL_FLUSH bounds the wait for a fatal record to reach a stalled stderr.
+// unbounded-input, unbounded-stalled-request and unbounded-shutdown defects.
 const HEADERS_TIMEOUT_MS = 60000;    // time allowed to receive complete headers
 const REQUEST_TIMEOUT_MS = 300000;   // time allowed to receive the entire request
 const KEEP_ALIVE_TIMEOUT_MS = 5000;  // idle time allowed after a response
@@ -21,7 +20,6 @@ const MAX_URL_LENGTH = 2048;         // request target longer than this -> 414
 const MAX_BODY_BYTES = 1048576;      // request body larger than this -> 413
 const SOCKET_IDLE_MS = 120000;       // socket inactivity bound; 0, the default, means none
 const SHUTDOWN_GRACE_MS = 10000;     // in-flight drain window before a forced close
-const FATAL_FLUSH_MS = 2000;         // longest wait for a fatal record to reach stderr
 
 const ALLOWED_METHODS = ['GET', 'HEAD'];
 const BODY = 'Hello, World!\n';
@@ -32,7 +30,6 @@ const sockets = new Set();
 let shuttingDown = false;
 let forcedClose = false; // set when the grace deadline fires, so the exit code stays 1
 let hadError = false;    // a server 'error' event must not be erased by a later clean close
-let fatalRecorded = false; // one fatal sequence per process, however many events arrive
 
 // Request targets reach the log, so they are reduced to the path, stripped of
 // control characters and truncated. Query strings never appear: they can carry
@@ -76,45 +73,13 @@ function releaseSocket(socket) {
   }
 }
 
-// Releases the socket behind a request the server will not read any further, once
-// that request's response has actually been written. 'finish' is the point at
-// which the last byte has been handed to the operating system; 'close' covers a
-// response that ended without finishing because the connection had already
-// failed. Releasing any earlier discards the response itself.
-function releaseAfterResponse(req, res) {
-  const socket = req.socket;
-  if (res.writableFinished) {
-    releaseSocket(socket);
-    return;
-  }
-  res.once('finish', () => releaseSocket(socket));
-  res.once('close', () => releaseSocket(socket));
-}
-
-// Refuses a payload over MAX_BODY_BYTES, for both the declared-length and the
-// streamed path, so the two cannot drift apart. Inbound flow is stopped rather
-// than torn down: destroying the request destroys its socket in the same tick --
-// measured, the response's own 'finish' then reports the socket already destroyed
-// -- so a 413 still in the write buffer is discarded and the client is reset
-// instead of answered. pause() stops pulling in a payload that has already been
-// refused, and TCP back-pressure stops the sender from making progress, while the
-// 'Connection: close' that sendError() sets tells the client this socket is
-// finished with. The socket itself goes only once the 413 has left the process.
-function refusePayload(req, res) {
-  req.pause();
-  sendError(res, 413);
-  releaseAfterResponse(req, res);
-}
-
-// Rejects a request whose *declared* body size exceeds MAX_BODY_BYTES. A streamed
-// body declares no size, so the handler enforces the same cap by counting bytes
-// as they arrive; both paths refuse through refusePayload(), which is what keeps
-// the two responses identical. Returning true means the request has been answered
-// and must not be served.
+// Rejects a request whose declared or streamed body exceeds MAX_BODY_BYTES.
+// Returning true means the request has been answered and must not be served.
 function bodyExceedsLimit(req, res) {
   const declared = Number(req.headers['content-length']);
   if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
-    refusePayload(req, res);
+    sendError(res, 413);
+    req.destroy(); // do not drain a payload we have already refused
     return true;
   }
   return false;
@@ -226,11 +191,8 @@ const server = http.createServer({ connectionsCheckingInterval: CONNECTIONS_CHEC
       received += chunk.length;
       if (received > MAX_BODY_BYTES && !answered) {
         answered = true;
-        // The same refusal the declared-length path takes. `answered` makes every
-        // later 'data' chunk and the 'end' event below no-ops, so the refused
-        // request is never also served, and the paused stream stops pulling in
-        // the rest of a payload this response has already rejected.
-        refusePayload(req, res);
+        sendError(res, 413);
+        req.destroy(); // do not drain a payload we have already refused
       }
     });
     req.on('end', () => {
@@ -374,51 +336,17 @@ function shutdown(signal) {
 
 }
 
-// Records a fatal condition and terminates with 1. Writing the record with
-// console.error() and then calling process.exit(1) is not enough: a supervisor
-// gives this process a pipe for stderr, writes to a pipe complete
-// asynchronously, and process.exit() abandons whatever has not drained --
-// measured, a stack larger than the 64 KiB pipe buffer arrived truncated, losing
-// the only account of why the process died. So the record is written through the
-// stream's own completion callback and the exit happens from there.
-function fatal(message) {
-  if (fatalRecorded) return; // a second fatal event must not restart this sequence
-  fatalRecorded = true;
-  // Set before anything can go wrong below, so that an event loop which empties
-  // while the write is still in flight still leaves with a failure code.
-  process.exitCode = 1;
-
-  // The process state is undefined from here on, so nothing more is accepted or
-  // served: an abandoned half-written response is worse than a closed connection.
-  if (!shuttingDown) {
-    shuttingDown = true;
-    server.close();
-  }
-  for (const socket of sockets) socket.destroy();
-
-  // A stderr that never drains -- a full pipe with no reader, or a stream already
-  // in an error state -- must not turn a fatal exit into a hang. unref() keeps
-  // this deadline from being the reason the process stays alive.
-  const deadline = setTimeout(() => process.exit(1), FATAL_FLUSH_MS);
-  deadline.unref();
-  // If stderr fails outright there is nowhere left to report it, and the only
-  // remaining obligation is the exit code.
-  process.stderr.once('error', () => process.exit(1));
-  process.stderr.write(`${message}\n`, () => {
-    clearTimeout(deadline);
-    process.exit(1);
-  });
-}
-
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-// Last resort only: the process is in an undefined state, so record it and exit.
+// Last resort only: the process is in an undefined state, so log and exit.
 process.on('uncaughtException', (err, origin) => {
-  fatal(`Fatal: uncaught exception (origin=${origin}): ${err.stack || err}`);
+  console.error(`Fatal: uncaught exception (origin=${origin}): ${err.stack || err}`);
+  process.exit(1);
 });
 process.on('unhandledRejection', (reason) => {
-  fatal(`Fatal: unhandled promise rejection: ${reason instanceof Error ? reason.stack : reason}`);
+  console.error(`Fatal: unhandled promise rejection: ${reason instanceof Error ? reason.stack : reason}`);
+  process.exit(1);
 });
 
 server.listen(port, hostname, () => {
